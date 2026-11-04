@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-BOT_VERSION = "2.0.2"
+BOT_VERSION = "2.0.3"
 """Generic giveaway bot — first-come, one account per Telegram user.
 
 The prize is NOT hardcoded: the item name, channel and accounts all live
@@ -20,6 +20,20 @@ Rules (fail-closed, no credentials in logs):
   * Credentials are sent ONLY by private DM to the claimer, never to the
     channel, a group, or the log. The state DB stores only user_id and
     account_index — never login/password.
+
+v2.0.3 change:
+  * Bulk import (app-side): accounts.json may now hold code-only
+    entries (username set, password empty) as well as
+    username|password and username|password|2fa entries. The app
+    parses one account per pasted line; this bot only reads the
+    resulting accounts.json, so the two sides agree on that file.
+  * Channel normalisation: a pasted full link (https://t.me/<name>)
+    is now reduced to the plain channel name, so the earlier
+    "chat not found" failure from a link in config.json cannot recur.
+  * Claim DM is intro + credentials ONLY, no footer lines at all:
+    code-only sends a Code line; otherwise Username/Password lines
+    plus a 2FA line only when present. No password-change advice and
+    no do-not-share advice are appended, for any account type.
 
 v2.0.2 change (why the channel button could never open the bot):
   * The channel post button was a callback button, which NEVER opens a
@@ -88,6 +102,25 @@ def load_env(path):
     return env
 
 
+def normalize_channel(value):
+    """Plain channel name, whatever the user pasted.
+
+    Accepts a plain name, "@name", "t.me/name",
+    "http://t.me/name" and "https://t.me/name" (with or without a
+    trailing slash) and returns just "name". Anything else is
+    returned trimmed and unchanged.
+    """
+    channel = (value or "").strip()
+    lowered = channel.lower()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if lowered.startswith(prefix):
+            channel = channel[len(prefix):]
+            lowered = channel.lower()
+            break
+    channel = channel.strip().lstrip("@").strip().rstrip("/")
+    return channel
+
+
 def load_config(path, env):
     """config.json wins; .env CHANNEL_USERNAME is a legacy fallback."""
     config = {}
@@ -96,7 +129,7 @@ def load_config(path, env):
             config = json.load(f)
     channel = config.get("channel") or env.get("CHANNEL_USERNAME", "")
     item_name = config.get("item_name") or "CapCut Pro"
-    return {"channel": channel.lstrip("@"), "item_name": item_name}
+    return {"channel": normalize_channel(channel), "item_name": item_name}
 
 
 def load_accounts(path):
@@ -109,7 +142,9 @@ def load_accounts(path):
         )
         password = item.get("password") or ""
         twofa = item.get("twofa") or item.get("2fa") or item.get("totp_secret") or ""
-        if username and password:
+        if username:
+            # v2.0.3: code-only entries have an empty password and are
+            # valid. Only an empty username is skipped.
             accounts.append(
                 {"username": username, "password": password, "twofa": twofa}
             )
@@ -415,17 +450,19 @@ class GiveawayBot:
         twofa_line = ""
         if account.get("twofa"):
             twofa_line = "2FA: <code>%s</code>\n" % account["twofa"]
-        # NOTE (2.0.1 fix): % must apply to the WHOLE message, not just
-        # the last string literal — % binds tighter than +, so the old
-        # code formatted only the warning line (which has no placeholders)
-        # and raised "not all arguments converted", killing the DM.
-        dm_text = (
-            intro
-            + "Username: <code>%s</code>\nPassword: <code>%s</code>\n"
-            + twofa_line
-            + "\n⚠️ ရပြီးချင်း password ကို ချက်ချင်း ပြောင်းပါ။\n"
-            "ဒီ account ကို တခြားသူနဲ့ မျှမသုံးပါနဲ့။"
-        ) % (account["username"], account["password"])
+        # v2.0.3: DM is intro + credentials ONLY, no footer lines.
+        # (The 2.0.1 % formatting lesson still applies: % must apply
+        # to the WHOLE message, not just the last string literal.)
+        if not account.get("password"):
+            dm_text = intro + "Code: <code>%s</code>\n" % account["username"]
+            if twofa_line:
+                dm_text += twofa_line
+        else:
+            dm_text = (
+                intro
+                + "Username: <code>%s</code>\nPassword: <code>%s</code>\n"
+                + twofa_line
+            ) % (account["username"], account["password"])
         self.tg.send_message(user_id, dm_text)
         self.refresh_giveaway_post()
 

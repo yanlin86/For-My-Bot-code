@@ -1,17 +1,1 @@
-{
-  "id": "giveaway",
-  "name": "Giveaway Bot",
-  "version": "2.0.2",
-  "language": "python",
-  "entry_point": "bot.py",
-  "runtime": "python3, standard library only, no pip packages",
-  "description": "First-come giveaway bot: one account per Telegram user, channel-join check, credentials by private DM only.",
-  "config_files": [".env", "config.json", "accounts.json"],
-  "config_fields": {
-    ".env": ["BOT_TOKEN", "ADMIN_ID"],
-    "config.json": ["channel", "item_name"],
-    "accounts.json": ["username", "password", "twofa (optional)"]
-  },
-  "state_files": ["state.db", "bot_version"],
-  "notes": "Secrets are never stored in this repo. Token and accounts are filled in the manager app and written to the VPS only."
-}
+{"bulk_import":{"code_only":true,"formats":["CODE","username|password","username|password|2fa"],"note":"Bulk import is app-side: the app parses one account per pasted line into accounts.json. The bot only reads accounts.json, so both sides agree on that file. Claim DM is intro + credentials only, with no footer warnings."},"config_fields":{".env":["BOT_TOKEN","ADMIN_ID"],"accounts.json":["username","password","twofa (optional)"],"config.json":["channel","item_name"]},"config_files":[".env","config.json","accounts.json"],"description":"First-come giveaway bot: one account per Telegram user, channel-join check, credentials by private DM only.","entry_point":"bot.py","id":"giveaway","language":"python","name":"Giveaway Bot","notes":"Secrets are never stored in this repo. Token and accounts are filled in the manager app and written to the VPS only. v2.0.3 supports bulk import and code-only accounts; channel values may be a plain name, @name, or a full t.me link.","runtime":"python3, standard library only, no pip packages","state_files":["state.db","bot_version"],"version":"2.0.3"}
