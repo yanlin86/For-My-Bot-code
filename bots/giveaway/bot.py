@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-BOT_VERSION = "2.0.3"
+BOT_VERSION = "2.0.4"
 """Generic giveaway bot — first-come, one account per Telegram user.
 
 The prize is NOT hardcoded: the item name, channel and accounts all live
@@ -20,6 +20,24 @@ Rules (fail-closed, no credentials in logs):
   * Credentials are sent ONLY by private DM to the claimer, never to the
     channel, a group, or the log. The state DB stores only user_id and
     account_index — never login/password.
+
+v2.0.4 change:
+  * Ever-claimed blocklist: a user who received an account in ANY
+    earlier giveaway can never receive one again. A new ever_claimed
+    table records every claimer forever; the app Reset clears only
+    the current giveaway's claims (plus the stored post id), so
+    ever_claimed survives every Reset by construction. Claim order:
+    current-claim repeat first (same account resent), then
+    ever-claimed block (short message, no account consumed, post
+    count unchanged), then a new claim, which inserts into BOTH
+    claims and ever_claimed in one transaction.
+  * Grandfather migration (one-time, idempotent, on startup): if
+    ever_claimed is empty, current claims rows are copied into it,
+    so people who already took accounts before this update are
+    remembered. It never re-copies afterwards. Limitation: claims
+    already cleared by a Reset before this update are gone and
+    cannot be grandfathered — only claims present at upgrade time
+    are remembered.
 
 v2.0.3 change:
   * Bulk import (app-side): accounts.json may now hold code-only
@@ -55,7 +73,8 @@ Config (same directory, chmod 600):
                  "item_name": "CapCut Pro"}
   accounts.json [{"username": "user@example.com", "password": "....",
                   "twofa": ""}, ...]   (twofa optional, may be empty)
-  state.db      created automatically (claims + giveaway message id)
+  state.db      created automatically (claims + ever_claimed +
+                giveaway message id + update offset)
   bot_version   written by the bot on startup (manager app reads it)
 
 Stdlib only — no pip packages needed.
@@ -166,6 +185,27 @@ def init_db(conn):
         " key TEXT PRIMARY KEY, value TEXT"
         ")"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ever_claimed ("
+        " user_id INTEGER PRIMARY KEY,"
+        " username TEXT,"
+        " first_claimed_at TEXT NOT NULL DEFAULT (datetime('now'))"
+        ")"
+    )
+    # v2.0.4 grandfather migration (one-time, idempotent): only when
+    # ever_claimed is still empty do we copy current claims into it.
+    # Later claims are added at claim time, never re-copied here, so
+    # a Reset (which clears claims only) can never resurrect an old
+    # claimer into ever_claimed — and ever_claimed is never cleared.
+    ever_count = conn.execute(
+        "SELECT COUNT(*) FROM ever_claimed"
+    ).fetchone()[0]
+    if ever_count == 0:
+        conn.execute(
+            "INSERT OR IGNORE INTO ever_claimed"
+            " (user_id, username, first_claimed_at)"
+            " SELECT user_id, username, claimed_at FROM claims"
+        )
     conn.commit()
 
 
@@ -188,8 +228,13 @@ def set_meta(conn, key, value):
 def claim_account(conn, user_id, username, total_accounts):
     """Atomic claim. Returns (status, account_index or None).
 
-    status: 'ok' | 'already' | 'sold_out'
+    status: 'ok' | 'already' | 'blocked_ever' | 'sold_out'
     'already' returns the user's original account_index.
+    'blocked_ever' means the user received an account in an earlier
+    giveaway (present in ever_claimed, absent from current claims):
+    no account is consumed and no current claim is recorded.
+    A new claim inserts into BOTH claims and ever_claimed in the
+    same transaction, so the two can never diverge.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -200,6 +245,13 @@ def claim_account(conn, user_id, username, total_accounts):
         if row:
             conn.execute("COMMIT")
             return "already", row[0]
+        ever = conn.execute(
+            "SELECT 1 FROM ever_claimed WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if ever:
+            conn.execute("COMMIT")
+            return "blocked_ever", None
         count = conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
         if count >= total_accounts:
             conn.execute("COMMIT")
@@ -208,6 +260,11 @@ def claim_account(conn, user_id, username, total_accounts):
             "INSERT INTO claims (user_id, account_index, username)"
             " VALUES (?, ?, ?)",
             (user_id, count, username or ""),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO ever_claimed (user_id, username)"
+            " VALUES (?, ?)",
+            (user_id, username or ""),
         )
         conn.execute("COMMIT")
         return "ok", count
@@ -438,6 +495,20 @@ class GiveawayBot:
             log.info("claim sold_out: user %s", user_id)
             return
 
+        if status == "blocked_ever":
+            # v2.0.4: received an account in an earlier giveaway, so
+            # no account this time. No current claim is recorded, no
+            # account is consumed, and the post is NOT refreshed
+            # (its count is unchanged) — we return before the
+            # refresh call at the end of do_claim.
+            self.tg.send_message(
+                user_id,
+                "ℹ️ သင် အရင် giveaway မှာ account တစ်ခု ရပြီးသားပါ — "
+                "ဒီတစ်ခါ giveaway မှာ ထပ်မရပါဘူး။"
+            )
+            log.info("claim blocked (ever-claimed): user %s", user_id)
+            return
+
         account = self.accounts[index]
         if status == "already":
             intro = (
@@ -510,13 +581,17 @@ class GiveawayBot:
                 self.tg.send_message(user_id, "Admin ပဲ သုံးလို့ရတဲ့ command ပါ။")
                 return
             rows = list_claims(self.conn)
+            ever_total = self.conn.execute(
+                "SELECT COUNT(*) FROM ever_claimed"
+            ).fetchone()[0]
             lines = [
                 "📊 Giveaway status: %d / %d ပေးပြီး, %d ခု ကျန်"
                 % (
                     len(rows),
                     len(self.accounts),
                     self.remaining(),
-                )
+                ),
+                "စုစုပေါင်း ရဖူးသူ: %d ယောက်" % ever_total,
             ]
             for uid, uname, idx, when in rows:
                 lines.append(
