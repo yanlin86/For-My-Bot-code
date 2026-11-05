@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-BOT_VERSION = "2.0.4"
+BOT_VERSION = "2.0.5"
 """Generic giveaway bot — first-come, one account per Telegram user.
 
 The prize is NOT hardcoded: the item name, channel and accounts all live
@@ -20,6 +20,24 @@ Rules (fail-closed, no credentials in logs):
   * Credentials are sent ONLY by private DM to the claimer, never to the
     channel, a group, or the log. The state DB stores only user_id and
     account_index — never login/password.
+
+v2.0.5 change (fastest possible reply — verified live 2026-11-04/05
+  that a claim flood delayed every reply by minutes, and claim taps
+  hit Telegram's 30s callback timeout):
+  * Every claim callback is answered IMMEDIATELY, before any other
+    work, with a short Burmese ack ("စစ်ဆေးနေပါတယ်, ခဏစောင့်ပါ"),
+    so the user sees feedback within a second while the claim is
+    still being processed. A callback never waits for getChatMember,
+    the DB, or the channel-post edit.
+  * Claim handling is DM-first: the DM (credentials or block
+    message) is sent first, and the channel-post edit is LAST and
+    best-effort only — a failed post edit only logs a warning and
+    can never delay or block the DM. The post count still updates
+    on every successful claim.
+  * Each getUpdates batch is processed messages-first: all message
+    updates (/start, /status, /post, /help) are handled before any
+    callback_query update in the same batch, so admin commands never
+    queue behind a claim flood.
 
 v2.0.4 change:
   * Ever-claimed blocklist: a user who received an account in ANY
@@ -104,6 +122,10 @@ logging.basicConfig(
 log = logging.getLogger("capcut-giveaway")
 
 JOINED_STATUSES = {"creator", "administrator", "member", "restricted"}
+
+# v2.0.5: instant callback ack text — shown as a toast the moment a
+# user taps Claim, before any getChatMember / DB / post-edit work.
+CLAIM_ACK_TEXT = "စစ်ဆေးနေပါတယ်, ခဏစောင့်ပါ"
 
 
 # ---------------------------------------------------------------- config
@@ -453,6 +475,11 @@ class GiveawayBot:
         return remaining_count(self.conn, len(self.accounts))
 
     def refresh_giveaway_post(self):
+        """Best-effort post edit, LAST after the DM (v2.0.5).
+
+        A failed edit only logs a warning — it must never raise, and
+        must never delay or block the DM that was already sent.
+        """
         raw = get_meta(self.conn, "giveaway_message")
         if not raw:
             return
@@ -466,10 +493,13 @@ class GiveawayBot:
             return
         left = self.remaining()
         markup = post_button(self.bot_username, self.item_name) if left > 0 else None
-        self.tg.edit_message(
-            chat_id, message_id,
-            giveaway_text(left, len(self.accounts), self.item_name), markup
-        )
+        try:
+            self.tg.edit_message(
+                chat_id, message_id,
+                giveaway_text(left, len(self.accounts), self.item_name), markup
+            )
+        except Exception as e:
+            log.warning("post refresh failed (best-effort, DM already sent): %s", e)
 
     def do_claim(self, user_id, username):
         """Full claim flow for one user. Sends all replies by DM."""
@@ -639,12 +669,46 @@ class GiveawayBot:
         user_id = user.get("id")
         username = user.get("username", "")
         data = callback.get("data", "")
-        self.tg.answer_callback(callback["id"])
+        if data == "claim" and user_id:
+            # v2.0.5: answer the callback IMMEDIATELY, before any
+            # getChatMember / DB / post-edit work, so the user sees
+            # feedback within a second even under a claim flood.
+            self.tg.answer_callback(callback["id"], CLAIM_ACK_TEXT)
+        else:
+            self.tg.answer_callback(callback["id"])
         if not user_id or data != "claim":
             return
         # Credentials always go by private DM, never to the channel/group
         # where the button was pressed.
         self.do_claim(user_id, username)
+
+    def process_updates(self, updates):
+        """Handle one getUpdates batch, messages first (v2.0.5).
+
+        All message updates (/start, /status, /post, /remaining)
+        are handled before any callback_query update in the same
+        batch, each pass in original order, so admin commands never
+        queue behind a claim flood. The offset is advanced past the
+        whole batch first, so a failed update is never re-processed.
+        """
+        if not updates:
+            return
+        offset = max(u.get("update_id", 0) for u in updates) + 1
+        set_meta(self.conn, "update_offset", str(offset))
+        for update in updates:
+            if "message" not in update:
+                continue
+            try:
+                self.handle_message(update["message"])
+            except Exception as e:
+                log.warning("update %s failed: %s", update.get("update_id"), e)
+        for update in updates:
+            if "callback_query" not in update:
+                continue
+            try:
+                self.handle_callback(update["callback_query"])
+            except Exception as e:
+                log.warning("update %s failed: %s", update.get("update_id"), e)
 
     def run(self):
         offset = get_meta(self.conn, "update_offset")
@@ -663,16 +727,8 @@ class GiveawayBot:
             if not result.get("ok"):
                 time.sleep(3)
                 continue
-            for update in result.get("result", []):
-                offset = update["update_id"] + 1
-                set_meta(self.conn, "update_offset", str(offset))
-                try:
-                    if "message" in update:
-                        self.handle_message(update["message"])
-                    elif "callback_query" in update:
-                        self.handle_callback(update["callback_query"])
-                except Exception as e:
-                    log.warning("update %s failed: %s", update["update_id"], e)
+            self.process_updates(result.get("result", []))
+            offset = int(get_meta(self.conn, "update_offset") or 0)
 
 
 def main():
